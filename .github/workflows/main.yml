@@ -1,0 +1,192 @@
+name: Try to Create OCI VM
+
+# 每5分钟运行一次（分散在整点后的 3,8,13,... 分钟）
+on:
+  schedule:
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+  # 允许手动触发
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  # 从 GitHub Secrets 读取必须的 OCI 配置
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION || 'us-chicago-1' }}  # 默认区域
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  # 可选：手动指定可用域和镜像 ID，若未指定则自动探测
+  AD_NAME: ${{ secrets.AD_NAME }}
+  IMAGE_ID: ${{ secrets.IMAGE_ID }}
+  SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache pip packages
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install OCI CLI and setup credentials
+        id: setup
+        run: |
+          set -euo pipefail
+
+          # 安装 OCI CLI
+          python -m pip install --user oci-cli
+
+          # 创建 OCI 目录和密钥文件
+          mkdir -p ~/.oci
+          echo "${{ env.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          # 生成配置文件
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ env.OCI_CLI_USER }}
+          tenancy=${{ env.OCI_CLI_TENANCY }}
+          fingerprint=${{ env.OCI_CLI_FINGERPRINT }}
+          key_file=~/.oci/oci_api_key.pem
+          region=${{ env.OCI_CLI_REGION }}
+          EOF
+
+          # 写入 SSH 公钥文件
+          echo "${{ env.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+          chmod 600 /home/runner/my_ssh_key.pub
+
+          # 输出配置摘要（脱敏）
+          echo "OCI CLI installed and configured for region: ${{ env.OCI_CLI_REGION }}"
+
+      - name: Resolve Availability Domain and Image ID
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          # 1. 获取可用域
+          if [ -n "${{ env.AD_NAME }}" ]; then
+            AD_NAME="${{ env.AD_NAME }}"
+            echo "Using AD from secret: $AD_NAME"
+          else
+            AD_NAME=$(oci iam availability-domain list \
+              --compartment-id "${{ env.COMPARTMENT_ID }}" \
+              --query 'data[0].name' \
+              --raw-output)
+            echo "Auto-resolved AD: $AD_NAME"
+          fi
+
+          # 2. 获取镜像 ID
+          if [ -n "${{ env.IMAGE_ID }}" ]; then
+            IMAGE_ID="${{ env.IMAGE_ID }}"
+            echo "Using Image ID from secret: $IMAGE_ID"
+          else
+            IMAGE_ID=$(oci compute image list \
+              --compartment-id "${{ env.COMPARTMENT_ID }}" \
+              --shape "VM.Standard.A1.Flex" \
+              --operating-system "Canonical Ubuntu" \
+              --operating-system-version "24.04" \
+              --sort-by TIMECREATED \
+              --sort-order DESC \
+              --query 'data[0].id' \
+              --raw-output)
+            echo "Auto-resolved Image ID: $IMAGE_ID"
+          fi
+
+          # 3. 验证非空
+          if [ -z "$AD_NAME" ] || [ -z "$IMAGE_ID" ]; then
+            echo "ERROR: AD_NAME or IMAGE_ID is empty." >&2
+            exit 1
+          fi
+
+          # 保存到 step 输出，供后续使用
+          echo "ad_name=$AD_NAME" >> $GITHUB_OUTPUT
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+
+      - name: Create A1.Flex VM (with debug)
+        id: create_vm
+        run: |
+          set -euo pipefail
+
+          AD_NAME="${{ steps.resolve.outputs.ad_name }}"
+          IMAGE_ID="${{ steps.resolve.outputs.image_id }}"
+
+          echo "=== Launching instance with the following parameters ==="
+          echo "Compartment: ${{ env.COMPARTMENT_ID }}"
+          echo "Availability Domain: $AD_NAME"
+          echo "Image ID: $IMAGE_ID"
+          echo "Subnet: ${{ env.SUBNET_ID }}"
+          echo "Shape: VM.Standard.A1.Flex, OCPUs=4, Memory=24GB"
+
+          # 执行创建命令，并捕获 stdout+stderr（包含 --debug 输出）
+          set +e  # 临时允许失败，以便我们捕获输出
+          OCI_OUTPUT=$(oci compute instance launch \
+            --compartment-id "${{ env.COMPARTMENT_ID }}" \
+            --availability-domain "$AD_NAME" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --subnet-id "${{ env.SUBNET_ID }}" \
+            --image-id "$IMAGE_ID" \
+            --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+            --assign-public-ip true \
+            --display-name "coolify-vm" \
+            --boot-volume-size-in-gbs 200 \
+            --debug 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          # 将输出存入 step 输出
+          echo "log_data<<EOF" >> $GITHUB_OUTPUT
+          echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # 判断是否成功（出现 PROVISIONING 状态）
+          if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+            echo "✅ Success! Instance is provisioning."
+            exit 0
+          else
+            echo "❌ Failed to create instance. Full debug output:" >&2
+            echo "$OCI_OUTPUT" >&2
+            exit 1
+          fi
+
+      - name: Send Discord Notification
+        if: always()
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
+          status: ${{ steps.create_vm.outcome }}
+          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
+          description: |
+            Attempt to create A1.Flex VM.
+            **Status:** `${{ steps.create_vm.outcome }}`
+
+            **Log Output (last 500 chars):**
+            ```json
+            ${{ steps.create_vm.outputs.log_data | truncate(500) }}
+            ```
+
+      - name: Queue next retry (manual only)
+        if: failure() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Retrying in 5 minutes..."
+          sleep 300
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/create-vm.yml/dispatches" \
+            -d '{"ref":"main"}'
